@@ -1,13 +1,11 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading;
 using UnityEditor;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace OpenClaw.UnityBridge.Editor
 {
@@ -15,10 +13,8 @@ namespace OpenClaw.UnityBridge.Editor
     public static class OpenClawBridgeServer
     {
         private static HttpListener _listener;
-        private static Thread _thread;
         private static bool _running;
 
-        // Queue for main-thread execution
         private static readonly ConcurrentQueue<Action> _mainThreadQueue = new ConcurrentQueue<Action>();
 
         private const int PORT = 18790;
@@ -37,10 +33,17 @@ namespace OpenClaw.UnityBridge.Editor
             if (_running) return;
             _listener = new HttpListener();
             _listener.Prefixes.Add($"http://127.0.0.1:{PORT}/");
-            _listener.Start();
+            try
+            {
+                _listener.Start();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[OpenClaw Bridge] Failed to start: {e.Message}");
+                return;
+            }
             _running = true;
-            _thread = new Thread(Listen) { IsBackground = true };
-            _thread.Start();
+            BeginAccept();
             Debug.Log($"[OpenClaw Bridge] Listening on http://127.0.0.1:{PORT}/");
         }
 
@@ -48,85 +51,67 @@ namespace OpenClaw.UnityBridge.Editor
         {
             if (!_running) return;
             _running = false;
-            _listener?.Stop();
+            try { _listener?.Stop(); } catch { }
+            _listener = null;
             Debug.Log("[OpenClaw Bridge] Stopped.");
         }
 
-        private static void ProcessMainThreadQueue()
+        private static void BeginAccept()
         {
-            while (_mainThreadQueue.TryDequeue(out var action))
+            if (!_running || _listener == null) return;
+            try
             {
-                try { action(); }
-                catch (Exception e) { Debug.LogError("[OpenClaw Bridge] MainThread error: " + e.Message); }
+                _listener.BeginGetContext(OnContext, null);
+            }
+            catch (Exception e)
+            {
+                if (_running) Debug.LogError("[OpenClaw Bridge] BeginGetContext error: " + e.Message);
             }
         }
 
-        private static void Listen()
+        private static void OnContext(IAsyncResult ar)
         {
-            while (_running)
+            // Accept next connection immediately
+            BeginAccept();
+
+            HttpListenerContext ctx;
+            try
             {
-                try
-                {
-                    var ctx = _listener.GetContext();
-                    HandleRequest(ctx);
-                }
-                catch (Exception e)
-                {
-                    if (_running) Debug.LogError("[OpenClaw Bridge] " + e.Message);
-                }
+                ctx = _listener.EndGetContext(ar);
             }
-        }
+            catch { return; }
 
-        private static void HandleRequest(HttpListenerContext ctx)
-        {
-            var req = ctx.Request;
-            var res = ctx.Response;
+            // Read body on this thread pool thread
+            string body = "";
+            if (ctx.Request.HasEntityBody)
+            {
+                using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
+                body = reader.ReadToEnd();
+            }
 
-            // Token auth
+            string path = ctx.Request.Url.AbsolutePath.TrimEnd('/');
+            string method = ctx.Request.HttpMethod.ToUpper();
+
+            // Auth check
             var token = OpenClawBridgeSettings.Token;
             if (!string.IsNullOrEmpty(token))
             {
-                var auth = req.Headers["Authorization"] ?? "";
+                var auth = ctx.Request.Headers["Authorization"] ?? "";
                 if (auth != "Bearer " + token)
                 {
-                    SendJson(res, 401, "{\"error\":\"unauthorized\"}");
+                    SendJson(ctx.Response, 401, "{\"error\":\"unauthorized\"}");
                     return;
                 }
             }
 
-            string body = "";
-            if (req.HasEntityBody)
+            // /status can respond immediately without main thread
+            if (method == "GET" && path == "/status")
             {
-                using var reader = new StreamReader(req.InputStream, req.ContentEncoding);
-                body = reader.ReadToEnd();
-            }
-
-            string path = req.Url.AbsolutePath.TrimEnd('/');
-            string method = req.HttpMethod.ToUpper();
-
-            // Routes that need main thread
-            bool needsMainThread = method == "POST" || path == "/scene" || path == "/hierarchy";
-
-            if (!needsMainThread)
-            {
-                // Handle directly (GET /status)
-                try
-                {
-                    var result = Route(method, path, body);
-                    SendJson(res, 200, result);
-                }
-                catch (NotSupportedException)
-                {
-                    SendJson(res, 404, "{\"error\":\"not found\"}");
-                }
-                catch (Exception e)
-                {
-                    SendJson(res, 500, $"{{\"error\":\"{Escape(e.Message)}\"}}");
-                }
+                SendJson(ctx.Response, 200, "{\"status\":\"ok\",\"version\":\"0.1.0\"}");
                 return;
             }
 
-            // Dispatch to main thread, block until done
+            // Everything else needs main thread
             var mre = new ManualResetEventSlim(false);
             string responseBody = "";
             int statusCode = 200;
@@ -136,7 +121,6 @@ namespace OpenClaw.UnityBridge.Editor
                 try
                 {
                     responseBody = Route(method, path, body);
-                    statusCode = 200;
                 }
                 catch (NotSupportedException)
                 {
@@ -148,41 +132,34 @@ namespace OpenClaw.UnityBridge.Editor
                     responseBody = $"{{\"error\":\"{Escape(e.Message)}\"}}";
                     statusCode = 500;
                 }
-                finally
-                {
-                    mre.Set();
-                }
+                finally { mre.Set(); }
             });
 
-            mre.Wait(5000);
-            SendJson(res, statusCode, responseBody);
+            mre.Wait(8000);
+            SendJson(ctx.Response, statusCode, responseBody);
+        }
+
+        private static void ProcessMainThreadQueue()
+        {
+            while (_mainThreadQueue.TryDequeue(out var action))
+            {
+                try { action(); }
+                catch (Exception e) { Debug.LogError("[OpenClaw Bridge] Main thread error: " + e); }
+            }
         }
 
         private static string Route(string method, string path, string body)
         {
-            if (method == "GET" && path == "/status")
-                return "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
-            if (method == "GET" && path == "/scene")
-                return SceneApi.GetSceneInfo();
-            if (method == "GET" && path == "/hierarchy")
-                return SceneApi.GetHierarchy();
-            if (method == "POST" && path == "/gameobject/create")
-                return GameObjectApi.Create(body);
-            if (method == "POST" && path == "/gameobject/destroy")
-                return GameObjectApi.Destroy(body);
-            if (method == "POST" && path == "/gameobject/component/add")
-                return GameObjectApi.AddComponent(body);
-            if (method == "POST" && path == "/asset/refresh")
-                return AssetApi.Refresh();
-            if (method == "POST" && path == "/editor/play")
-                return EditorApi.Play();
-            if (method == "POST" && path == "/editor/stop")
-                return EditorApi.Stop();
-            if (method == "POST" && path == "/editor/pause")
-                return EditorApi.Pause();
-            if (method == "POST" && path == "/script/create")
-                return AssetApi.CreateScript(body);
-
+            if (method == "GET" && path == "/scene")    return SceneApi.GetSceneInfo();
+            if (method == "GET" && path == "/hierarchy") return SceneApi.GetHierarchy();
+            if (method == "POST" && path == "/gameobject/create")        return GameObjectApi.Create(body);
+            if (method == "POST" && path == "/gameobject/destroy")       return GameObjectApi.Destroy(body);
+            if (method == "POST" && path == "/gameobject/component/add") return GameObjectApi.AddComponent(body);
+            if (method == "POST" && path == "/asset/refresh")            return AssetApi.Refresh();
+            if (method == "POST" && path == "/editor/play")              return EditorApi.Play();
+            if (method == "POST" && path == "/editor/stop")              return EditorApi.Stop();
+            if (method == "POST" && path == "/editor/pause")             return EditorApi.Pause();
+            if (method == "POST" && path == "/script/create")            return AssetApi.CreateScript(body);
             throw new NotSupportedException();
         }
 
@@ -197,7 +174,7 @@ namespace OpenClaw.UnityBridge.Editor
                 res.OutputStream.Write(buf, 0, buf.Length);
                 res.OutputStream.Close();
             }
-            catch { /* client disconnected */ }
+            catch { }
         }
 
         internal static string Escape(string s) =>
