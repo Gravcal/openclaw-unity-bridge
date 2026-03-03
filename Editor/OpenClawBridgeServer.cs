@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using UnityEditor;
@@ -12,10 +13,12 @@ namespace OpenClaw.UnityBridge.Editor
     [InitializeOnLoad]
     public static class OpenClawBridgeServer
     {
-        private static HttpListener _listener;
+        private static TcpListener _listener;
+        private static Thread _thread;
         private static bool _running;
 
-        private static readonly ConcurrentQueue<Action> _mainThreadQueue = new ConcurrentQueue<Action>();
+        private static readonly ConcurrentQueue<(string method, string path, string body, Action<int,string> reply)>
+            _mainThreadQueue = new ConcurrentQueue<(string, string, string, Action<int,string>)>();
 
         private const int PORT = 18790;
 
@@ -31,10 +34,9 @@ namespace OpenClaw.UnityBridge.Editor
         public static void Start()
         {
             if (_running) return;
-            _listener = new HttpListener();
-            _listener.Prefixes.Add($"http://127.0.0.1:{PORT}/");
             try
             {
+                _listener = new TcpListener(IPAddress.Loopback, PORT);
                 _listener.Start();
             }
             catch (Exception e)
@@ -43,7 +45,8 @@ namespace OpenClaw.UnityBridge.Editor
                 return;
             }
             _running = true;
-            BeginAccept();
+            _thread = new Thread(Listen) { IsBackground = true, Name = "OpenClawBridge" };
+            _thread.Start();
             Debug.Log($"[OpenClaw Bridge] Listening on http://127.0.0.1:{PORT}/");
         }
 
@@ -56,102 +59,127 @@ namespace OpenClaw.UnityBridge.Editor
             Debug.Log("[OpenClaw Bridge] Stopped.");
         }
 
-        private static void BeginAccept()
+        private static void Listen()
         {
-            if (!_running || _listener == null) return;
-            try
-            {
-                _listener.BeginGetContext(OnContext, null);
-            }
-            catch (Exception e)
-            {
-                if (_running) Debug.LogError("[OpenClaw Bridge] BeginGetContext error: " + e.Message);
-            }
-        }
-
-        private static void OnContext(IAsyncResult ar)
-        {
-            // Accept next connection immediately
-            BeginAccept();
-
-            HttpListenerContext ctx;
-            try
-            {
-                ctx = _listener.EndGetContext(ar);
-            }
-            catch { return; }
-
-            // Read body on this thread pool thread
-            string body = "";
-            if (ctx.Request.HasEntityBody)
-            {
-                using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
-                body = reader.ReadToEnd();
-            }
-
-            string path = ctx.Request.Url.AbsolutePath.TrimEnd('/');
-            string method = ctx.Request.HttpMethod.ToUpper();
-
-            // Auth check
-            var token = OpenClawBridgeSettings.Token;
-            if (!string.IsNullOrEmpty(token))
-            {
-                var auth = ctx.Request.Headers["Authorization"] ?? "";
-                if (auth != "Bearer " + token)
-                {
-                    SendJson(ctx.Response, 401, "{\"error\":\"unauthorized\"}");
-                    return;
-                }
-            }
-
-            // /status can respond immediately without main thread
-            if (method == "GET" && path == "/status")
-            {
-                SendJson(ctx.Response, 200, "{\"status\":\"ok\",\"version\":\"0.1.0\"}");
-                return;
-            }
-
-            // Everything else needs main thread
-            var mre = new ManualResetEventSlim(false);
-            string responseBody = "";
-            int statusCode = 200;
-
-            _mainThreadQueue.Enqueue(() =>
+            while (_running)
             {
                 try
                 {
-                    responseBody = Route(method, path, body);
-                }
-                catch (NotSupportedException)
-                {
-                    responseBody = "{\"error\":\"not found\"}";
-                    statusCode = 404;
+                    var client = _listener.AcceptTcpClient();
+                    ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
                 }
                 catch (Exception e)
                 {
-                    responseBody = $"{{\"error\":\"{Escape(e.Message)}\"}}";
-                    statusCode = 500;
+                    if (_running) Debug.LogError("[OpenClaw Bridge] Accept error: " + e.Message);
                 }
-                finally { mre.Set(); }
-            });
+            }
+        }
 
-            mre.Wait(8000);
-            SendJson(ctx.Response, statusCode, responseBody);
+        private static void HandleClient(TcpClient client)
+        {
+            try
+            {
+                using (client)
+                {
+                    var stream = client.GetStream();
+                    var reader = new StreamReader(stream, Encoding.UTF8);
+                    var writer = new StreamWriter(stream, new UTF8Encoding(false)) { NewLine = "\r\n", AutoFlush = false };
+
+                    // Read request line
+                    string requestLine = reader.ReadLine();
+                    if (string.IsNullOrEmpty(requestLine)) return;
+
+                    var parts = requestLine.Split(' ');
+                    if (parts.Length < 2) return;
+                    string method = parts[0].ToUpper();
+                    string path = parts[1].Split('?')[0].TrimEnd('/');
+                    if (string.IsNullOrEmpty(path)) path = "/";
+
+                    // Read headers
+                    int contentLength = 0;
+                    string authHeader = "";
+                    string line;
+                    while (!string.IsNullOrEmpty(line = reader.ReadLine()))
+                    {
+                        if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                            int.TryParse(line.Substring(15).Trim(), out contentLength);
+                        if (line.StartsWith("Authorization:", StringComparison.OrdinalIgnoreCase))
+                            authHeader = line.Substring(14).Trim();
+                    }
+
+                    // Auth check
+                    var token = OpenClawBridgeSettings.Token;
+                    if (!string.IsNullOrEmpty(token) && authHeader != "Bearer " + token)
+                    {
+                        SendResponse(writer, 401, "{\"error\":\"unauthorized\"}");
+                        return;
+                    }
+
+                    // Read body
+                    string body = "";
+                    if (contentLength > 0)
+                    {
+                        var buf = new char[contentLength];
+                        reader.Read(buf, 0, contentLength);
+                        body = new string(buf);
+                    }
+
+                    // /status — no main thread needed
+                    if (method == "GET" && path == "/status")
+                    {
+                        SendResponse(writer, 200, "{\"status\":\"ok\",\"version\":\"0.1.1\"}");
+                        return;
+                    }
+
+                    // Dispatch to main thread
+                    var mre = new ManualResetEventSlim(false);
+                    int statusCode = 200;
+                    string responseBody = "";
+
+                    _mainThreadQueue.Enqueue((method, path, body, (code, resp) =>
+                    {
+                        statusCode = code;
+                        responseBody = resp;
+                        mre.Set();
+                    }));
+
+                    if (mre.Wait(8000))
+                        SendResponse(writer, statusCode, responseBody);
+                    else
+                        SendResponse(writer, 504, "{\"error\":\"main thread timeout\"}");
+                }
+            }
+            catch (Exception e)
+            {
+                if (_running) Debug.LogError("[OpenClaw Bridge] HandleClient error: " + e.Message);
+            }
         }
 
         private static void ProcessMainThreadQueue()
         {
-            while (_mainThreadQueue.TryDequeue(out var action))
+            while (_mainThreadQueue.TryDequeue(out var item))
             {
-                try { action(); }
-                catch (Exception e) { Debug.LogError("[OpenClaw Bridge] Main thread error: " + e); }
+                var (method, path, body, reply) = item;
+                try
+                {
+                    var result = Route(method, path, body);
+                    reply(200, result);
+                }
+                catch (NotSupportedException)
+                {
+                    reply(404, "{\"error\":\"not found\"}");
+                }
+                catch (Exception e)
+                {
+                    reply(500, $"{{\"error\":\"{Escape(e.Message)}\"}}");
+                }
             }
         }
 
         private static string Route(string method, string path, string body)
         {
-            if (method == "GET" && path == "/scene")    return SceneApi.GetSceneInfo();
-            if (method == "GET" && path == "/hierarchy") return SceneApi.GetHierarchy();
+            if (method == "GET"  && path == "/scene")                    return SceneApi.GetSceneInfo();
+            if (method == "GET"  && path == "/hierarchy")                return SceneApi.GetHierarchy();
             if (method == "POST" && path == "/gameobject/create")        return GameObjectApi.Create(body);
             if (method == "POST" && path == "/gameobject/destroy")       return GameObjectApi.Destroy(body);
             if (method == "POST" && path == "/gameobject/component/add") return GameObjectApi.AddComponent(body);
@@ -163,18 +191,18 @@ namespace OpenClaw.UnityBridge.Editor
             throw new NotSupportedException();
         }
 
-        internal static void SendJson(HttpListenerResponse res, int code, string json)
+        private static void SendResponse(StreamWriter writer, int code, string json)
         {
-            try
-            {
-                res.StatusCode = code;
-                res.ContentType = "application/json";
-                var buf = Encoding.UTF8.GetBytes(json);
-                res.ContentLength64 = buf.Length;
-                res.OutputStream.Write(buf, 0, buf.Length);
-                res.OutputStream.Close();
-            }
-            catch { }
+            string status = code switch { 200 => "OK", 401 => "Unauthorized", 404 => "Not Found", 500 => "Internal Server Error", 504 => "Gateway Timeout", _ => "OK" };
+            var bytes = Encoding.UTF8.GetBytes(json);
+            writer.WriteLine($"HTTP/1.1 {code} {status}");
+            writer.WriteLine("Content-Type: application/json; charset=utf-8");
+            writer.WriteLine($"Content-Length: {bytes.Length}");
+            writer.WriteLine("Connection: close");
+            writer.WriteLine();
+            writer.Flush();
+            writer.BaseStream.Write(bytes, 0, bytes.Length);
+            writer.BaseStream.Flush();
         }
 
         internal static string Escape(string s) =>
