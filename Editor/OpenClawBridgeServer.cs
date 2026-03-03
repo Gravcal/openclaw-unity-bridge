@@ -73,8 +73,7 @@ namespace OpenClaw.UnityBridge.Editor
                 catch (Exception e)
                 {
                     if (_running) Debug.LogError("[OpenClaw Bridge] Accept error: " + e.Message);
-                }
-            }
+                }            }
         }
 
         private static void HandleClient(TcpClient client)
@@ -180,16 +179,25 @@ namespace OpenClaw.UnityBridge.Editor
 
         private static string Route(string method, string path, string body)
         {
-            if (method == "GET"  && path == "/scene")                    return SceneApi.GetSceneInfo();
-            if (method == "GET"  && path == "/hierarchy")                return SceneApi.GetHierarchy();
-            if (method == "POST" && path == "/gameobject/create")        return GameObjectApi.Create(body);
-            if (method == "POST" && path == "/gameobject/destroy")       return GameObjectApi.Destroy(body);
-            if (method == "POST" && path == "/gameobject/component/add") return GameObjectApi.AddComponent(body);
-            if (method == "POST" && path == "/asset/refresh")            return AssetApi.Refresh();
-            if (method == "POST" && path == "/editor/play")              return EditorApi.Play();
-            if (method == "POST" && path == "/editor/stop")              return EditorApi.Stop();
-            if (method == "POST" && path == "/editor/pause")             return EditorApi.Pause();
-            if (method == "POST" && path == "/script/create")            return AssetApi.CreateScript(body);
+            if (method == "GET"  && path == "/scene")                      return SceneApi.GetSceneInfo();
+            if (method == "GET"  && path == "/hierarchy")                  return SceneApi.GetHierarchy();
+            if (method == "POST" && path == "/scene/save")                 return SceneApi.Save(body);
+            if (method == "POST" && path == "/scene/new")                  return SceneApi.New(body);
+            if (method == "POST" && path == "/scene/open")                 return SceneApi.Open(body);
+            if (method == "GET"  && path == "/editor/status")              return EditorApi.Status();
+            if (method == "POST" && path == "/gameobject/create")          return GameObjectApi.Create(body);
+            if (method == "POST" && path == "/gameobject/destroy")         return GameObjectApi.Destroy(body);
+            if (method == "POST" && path == "/gameobject/component/add")   return GameObjectApi.AddComponent(body);
+            if (method == "POST" && path == "/gameobject/rename")          return GameObjectApi.Rename(body);
+            if (method == "POST" && path == "/gameobject/setactive")       return GameObjectApi.SetActive(body);
+            if (method == "POST" && path == "/gameobject/transform")       return GameObjectApi.SetTransform(body);
+            if (method == "POST" && path == "/asset/refresh")              return AssetApi.Refresh();
+            if (method == "POST" && path == "/asset/create-folder")        return AssetApi.CreateFolder(body);
+            if (method == "POST" && path == "/asset/list")                 return AssetApi.List(body);
+            if (method == "POST" && path == "/script/create")              return AssetApi.CreateScript(body);
+            if (method == "POST" && path == "/editor/play")                return EditorApi.Play();
+            if (method == "POST" && path == "/editor/stop")                return EditorApi.Stop();
+            if (method == "POST" && path == "/editor/pause")               return EditorApi.Pause();
             throw new NotSupportedException();
         }
 

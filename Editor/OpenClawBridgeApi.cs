@@ -29,6 +29,58 @@ namespace OpenClaw.UnityBridge.Editor
             return sb.ToString();
         }
 
+        // POST /scene/save  { "path": "Assets/Scenes/Test.unity" }
+        public static string Save(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            var scene = SceneManager.GetActiveScene();
+            string path = data.GetValueOrDefault("path", "");
+
+            if (!string.IsNullOrEmpty(path))
+            {
+                // Ensure folder exists
+                string dir = System.IO.Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    System.IO.Directory.CreateDirectory(dir);
+                EditorSceneManager.SaveScene(scene, path);
+            }
+            else
+            {
+                EditorSceneManager.SaveScene(scene);
+            }
+            AssetDatabase.Refresh();
+            var saved = SceneManager.GetActiveScene();
+            return $"{{\"success\":true,\"name\":\"{saved.name}\",\"path\":\"{saved.path}\"}}";
+        }
+
+        // POST /scene/new  { "path": "Assets/Scenes/MyScene.unity" }
+        public static string New(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string path = data.GetValueOrDefault("path", "");
+            var newScene = EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
+            if (!string.IsNullOrEmpty(path))
+            {
+                string dir = System.IO.Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    System.IO.Directory.CreateDirectory(dir);
+                EditorSceneManager.SaveScene(newScene, path);
+            }
+            AssetDatabase.Refresh();
+            return $"{{\"success\":true,\"name\":\"{newScene.name}\",\"path\":\"{newScene.path}\"}}";
+        }
+
+        // POST /scene/open  { "path": "Assets/Scenes/Test.unity" }
+        public static string Open(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string path = data.GetValueOrDefault("path", "");
+            if (string.IsNullOrEmpty(path)) return "{\"success\":false,\"error\":\"path required\"}";
+            EditorSceneManager.OpenScene(path);
+            var scene = SceneManager.GetActiveScene();
+            return $"{{\"success\":true,\"name\":\"{scene.name}\",\"path\":\"{scene.path}\"}}";
+        }
+
         private static void AppendGO(System.Text.StringBuilder sb, GameObject go, int depth)
         {
             sb.Append("{");
@@ -73,6 +125,13 @@ namespace OpenClaw.UnityBridge.Editor
                 if (parent != null) go.transform.SetParent(parent.transform);
             }
 
+            // Position
+            if (data.TryGetValue("position", out string posStr))
+            {
+                var pos = ParseVector3(posStr);
+                go.transform.position = pos;
+            }
+
             EditorUtility.SetDirty(go);
             return $"{{\"success\":true,\"name\":\"{go.name}\",\"instanceId\":{go.GetInstanceID()}}}";
         }
@@ -100,6 +159,61 @@ namespace OpenClaw.UnityBridge.Editor
             go.AddComponent(type);
             return "{\"success\":true}";
         }
+
+        // POST /gameobject/rename  { "name": "OldName", "newName": "NewName" }
+        public static string Rename(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string name = data.GetValueOrDefault("name", "");
+            string newName = data.GetValueOrDefault("newName", "");
+            var go = GameObject.Find(name);
+            if (go == null) return "{\"success\":false,\"error\":\"not found\"}";
+            go.name = newName;
+            EditorUtility.SetDirty(go);
+            return "{\"success\":true}";
+        }
+
+        // POST /gameobject/setactive  { "name": "Player", "active": "false" }
+        public static string SetActive(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string name = data.GetValueOrDefault("name", "");
+            bool active = data.GetValueOrDefault("active", "true").ToLower() != "false";
+            var go = GameObject.Find(name);
+            if (go == null) return "{\"success\":false,\"error\":\"not found\"}";
+            go.SetActive(active);
+            return $"{{\"success\":true,\"active\":{active.ToString().ToLower()}}}";
+        }
+
+        // POST /gameobject/transform  { "name": "Player", "position": "0,1,0", "rotation": "0,45,0", "scale": "1,1,1" }
+        public static string SetTransform(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string name = data.GetValueOrDefault("name", "");
+            var go = GameObject.Find(name);
+            if (go == null) return "{\"success\":false,\"error\":\"not found\"}";
+
+            if (data.TryGetValue("position", out string pos))
+                go.transform.position = ParseVector3(pos);
+            if (data.TryGetValue("rotation", out string rot))
+                go.transform.eulerAngles = ParseVector3(rot);
+            if (data.TryGetValue("scale", out string scale))
+                go.transform.localScale = ParseVector3(scale);
+
+            EditorUtility.SetDirty(go);
+            return "{\"success\":true}";
+        }
+
+        private static Vector3 ParseVector3(string s)
+        {
+            var parts = s.Split(',');
+            if (parts.Length >= 3 &&
+                float.TryParse(parts[0].Trim(), out float x) &&
+                float.TryParse(parts[1].Trim(), out float y) &&
+                float.TryParse(parts[2].Trim(), out float z))
+                return new Vector3(x, y, z);
+            return Vector3.zero;
+        }
     }
 
     public static class AssetApi
@@ -108,6 +222,18 @@ namespace OpenClaw.UnityBridge.Editor
         {
             AssetDatabase.Refresh();
             return "{\"success\":true}";
+        }
+
+        // POST /asset/create-folder  { "path": "Assets/Scenes" }
+        public static string CreateFolder(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string path = data.GetValueOrDefault("path", "");
+            if (string.IsNullOrEmpty(path)) return "{\"success\":false,\"error\":\"path required\"}";
+            if (!System.IO.Directory.Exists(path))
+                System.IO.Directory.CreateDirectory(path);
+            AssetDatabase.Refresh();
+            return $"{{\"success\":true,\"path\":\"{path}\"}}";
         }
 
         public static string CreateScript(string body)
@@ -121,9 +247,27 @@ namespace OpenClaw.UnityBridge.Editor
                 System.IO.Directory.CreateDirectory(folder);
 
             string path = $"{folder}/{fileName}.cs";
-            System.IO.File.WriteAllText(path, content);
+            System.IO.File.WriteAllText(path, content, new System.Text.UTF8Encoding(false));
             AssetDatabase.Refresh();
             return $"{{\"success\":true,\"path\":\"{path}\"}}";
+        }
+
+        // POST /asset/list  { "path": "Assets" }
+        public static string List(string body)
+        {
+            var data = SimpleJson.Parse(body);
+            string path = data.GetValueOrDefault("path", "Assets");
+            var guids = AssetDatabase.FindAssets("", new[] { path });
+            var sb = new System.Text.StringBuilder();
+            sb.Append("[");
+            for (int i = 0; i < guids.Length; i++)
+            {
+                if (i > 0) sb.Append(",");
+                string p = AssetDatabase.GUIDToAssetPath(guids[i]);
+                sb.Append($"\"{p}\"");
+            }
+            sb.Append("]");
+            return sb.ToString();
         }
     }
 
@@ -146,9 +290,14 @@ namespace OpenClaw.UnityBridge.Editor
             EditorApplication.isPaused = !EditorApplication.isPaused;
             return $"{{\"success\":true,\"paused\":{EditorApplication.isPaused.ToString().ToLower()}}}";
         }
+
+        // GET /editor/status
+        public static string Status()
+        {
+            return $"{{\"isPlaying\":{EditorApplication.isPlaying.ToString().ToLower()},\"isPaused\":{EditorApplication.isPaused.ToString().ToLower()},\"isCompiling\":{EditorApplication.isCompiling.ToString().ToLower()}}}";
+        }
     }
 
-    // Minimal JSON parser for simple flat key-value objects
     public static class SimpleJson
     {
         public static Dictionary<string, string> Parse(string json)
@@ -156,7 +305,6 @@ namespace OpenClaw.UnityBridge.Editor
             var result = new Dictionary<string, string>();
             if (string.IsNullOrEmpty(json)) return result;
             json = json.Trim().Trim('{', '}');
-            // Very basic: split by "key":"value" pairs
             var pattern = new System.Text.RegularExpressions.Regex(
                 "\"([^\"]+)\"\\s*:\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|([^,}]+))");
             foreach (System.Text.RegularExpressions.Match m in pattern.Matches(json))
