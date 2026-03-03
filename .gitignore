@@ -1,0 +1,6 @@
+.DS_Store
+*.user
+*.suo
+Temp/
+Library/
+obj/

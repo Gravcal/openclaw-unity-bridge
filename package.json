@@ -1,0 +1,13 @@
+{
+  "name": "com.gravex.openclaw-unity-bridge",
+  "displayName": "OpenClaw Unity Bridge",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "A Unity Editor plugin that exposes a local HTTP API, allowing OpenClaw AI assistant to control and interact with the Unity Editor.",
+  "author": {
+    "name": "Gravex",
+    "url": "https://github.com/Gravex"
+  },
+  "keywords": ["openclaw", "ai", "editor", "automation"],
+  "dependencies": {}
+}
