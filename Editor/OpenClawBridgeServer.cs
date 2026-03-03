@@ -16,6 +16,7 @@ namespace OpenClaw.UnityBridge.Editor
         private static TcpListener _listener;
         private static Thread _thread;
         private static bool _running;
+        private static string _cachedToken = "";
 
         private static readonly ConcurrentQueue<(string method, string path, string body, Action<int,string> reply)>
             _mainThreadQueue = new ConcurrentQueue<(string, string, string, Action<int,string>)>();
@@ -45,6 +46,7 @@ namespace OpenClaw.UnityBridge.Editor
                 return;
             }
             _running = true;
+            _cachedToken = OpenClawBridgeSettings.Token;
             _thread = new Thread(Listen) { IsBackground = true, Name = "OpenClawBridge" };
             _thread.Start();
             Debug.Log($"[OpenClaw Bridge] Listening on http://127.0.0.1:{PORT}/");
@@ -108,7 +110,7 @@ namespace OpenClaw.UnityBridge.Editor
                     }
 
                     // Auth check
-                    var token = OpenClawBridgeSettings.Token;
+                    var token = _cachedToken;
                     if (!string.IsNullOrEmpty(token) && authHeader != "Bearer " + token)
                     {
                         SendResponse(writer, 401, "{\"error\":\"unauthorized\"}");
