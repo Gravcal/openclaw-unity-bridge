@@ -1,11 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading;
 using UnityEditor;
-using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -18,10 +18,14 @@ namespace OpenClaw.UnityBridge.Editor
         private static Thread _thread;
         private static bool _running;
 
+        // Queue for main-thread execution
+        private static readonly ConcurrentQueue<Action> _mainThreadQueue = new ConcurrentQueue<Action>();
+
         private const int PORT = 18790;
 
         static OpenClawBridgeServer()
         {
+            EditorApplication.update += ProcessMainThreadQueue;
             if (OpenClawBridgeSettings.AutoStart)
                 Start();
         }
@@ -45,8 +49,16 @@ namespace OpenClaw.UnityBridge.Editor
             if (!_running) return;
             _running = false;
             _listener?.Stop();
-            _thread?.Abort();
             Debug.Log("[OpenClaw Bridge] Stopped.");
+        }
+
+        private static void ProcessMainThreadQueue()
+        {
+            while (_mainThreadQueue.TryDequeue(out var action))
+            {
+                try { action(); }
+                catch (Exception e) { Debug.LogError("[OpenClaw Bridge] MainThread error: " + e.Message); }
+            }
         }
 
         private static void Listen()
@@ -56,7 +68,7 @@ namespace OpenClaw.UnityBridge.Editor
                 try
                 {
                     var ctx = _listener.GetContext();
-                    ThreadPool.QueueUserWorkItem(_ => HandleRequest(ctx));
+                    HandleRequest(ctx);
                 }
                 catch (Exception e)
                 {
@@ -91,83 +103,104 @@ namespace OpenClaw.UnityBridge.Editor
 
             string path = req.Url.AbsolutePath.TrimEnd('/');
             string method = req.HttpMethod.ToUpper();
-            string response = "";
 
-            try
+            // Routes that need main thread
+            bool needsMainThread = method == "POST" || path == "/scene" || path == "/hierarchy";
+
+            if (!needsMainThread)
             {
-                response = Route(method, path, body);
-                SendJson(res, 200, response);
+                // Handle directly (GET /status)
+                try
+                {
+                    var result = Route(method, path, body);
+                    SendJson(res, 200, result);
+                }
+                catch (NotSupportedException)
+                {
+                    SendJson(res, 404, "{\"error\":\"not found\"}");
+                }
+                catch (Exception e)
+                {
+                    SendJson(res, 500, $"{{\"error\":\"{Escape(e.Message)}\"}}");
+                }
+                return;
             }
-            catch (NotSupportedException)
+
+            // Dispatch to main thread, block until done
+            var mre = new ManualResetEventSlim(false);
+            string responseBody = "";
+            int statusCode = 200;
+
+            _mainThreadQueue.Enqueue(() =>
             {
-                SendJson(res, 404, "{\"error\":\"not found\"}");
-            }
-            catch (Exception e)
-            {
-                SendJson(res, 500, $"{{\"error\":\"{Escape(e.Message)}\"}}");
-            }
+                try
+                {
+                    responseBody = Route(method, path, body);
+                    statusCode = 200;
+                }
+                catch (NotSupportedException)
+                {
+                    responseBody = "{\"error\":\"not found\"}";
+                    statusCode = 404;
+                }
+                catch (Exception e)
+                {
+                    responseBody = $"{{\"error\":\"{Escape(e.Message)}\"}}";
+                    statusCode = 500;
+                }
+                finally
+                {
+                    mre.Set();
+                }
+            });
+
+            mre.Wait(5000);
+            SendJson(res, statusCode, responseBody);
         }
 
         private static string Route(string method, string path, string body)
         {
-            // GET /status
             if (method == "GET" && path == "/status")
                 return "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
-
-            // GET /scene
             if (method == "GET" && path == "/scene")
                 return SceneApi.GetSceneInfo();
-
-            // GET /hierarchy
             if (method == "GET" && path == "/hierarchy")
                 return SceneApi.GetHierarchy();
-
-            // POST /gameobject/create
             if (method == "POST" && path == "/gameobject/create")
                 return GameObjectApi.Create(body);
-
-            // POST /gameobject/destroy
             if (method == "POST" && path == "/gameobject/destroy")
                 return GameObjectApi.Destroy(body);
-
-            // POST /gameobject/component/add
             if (method == "POST" && path == "/gameobject/component/add")
                 return GameObjectApi.AddComponent(body);
-
-            // POST /asset/refresh
             if (method == "POST" && path == "/asset/refresh")
                 return AssetApi.Refresh();
-
-            // POST /editor/play
             if (method == "POST" && path == "/editor/play")
                 return EditorApi.Play();
-
-            // POST /editor/stop
             if (method == "POST" && path == "/editor/stop")
                 return EditorApi.Stop();
-
-            // POST /editor/pause
             if (method == "POST" && path == "/editor/pause")
                 return EditorApi.Pause();
-
-            // POST /script/create
             if (method == "POST" && path == "/script/create")
                 return AssetApi.CreateScript(body);
 
             throw new NotSupportedException();
         }
 
-        private static void SendJson(HttpListenerResponse res, int code, string json)
+        internal static void SendJson(HttpListenerResponse res, int code, string json)
         {
-            res.StatusCode = code;
-            res.ContentType = "application/json";
-            var buf = Encoding.UTF8.GetBytes(json);
-            res.ContentLength64 = buf.Length;
-            res.OutputStream.Write(buf, 0, buf.Length);
-            res.OutputStream.Close();
+            try
+            {
+                res.StatusCode = code;
+                res.ContentType = "application/json";
+                var buf = Encoding.UTF8.GetBytes(json);
+                res.ContentLength64 = buf.Length;
+                res.OutputStream.Write(buf, 0, buf.Length);
+                res.OutputStream.Close();
+            }
+            catch { /* client disconnected */ }
         }
 
-        private static string Escape(string s) =>
+        internal static string Escape(string s) =>
             s?.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") ?? "";
     }
 }
