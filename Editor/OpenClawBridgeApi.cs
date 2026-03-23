@@ -298,6 +298,21 @@ namespace OpenClaw.UnityBridge.Editor
         }
     }
 
+    public static class ProjectApi
+    {
+        // GET /project
+        public static string GetProjectInfo()
+        {
+            string projectPath = System.IO.Path.GetFullPath(Application.dataPath + "/..");
+            string projectName = System.IO.Path.GetFileName(projectPath);
+            string unityVersion = Application.unityVersion;
+            return $"{{\"name\":\"{Escape(projectName)}\",\"path\":\"{Escape(projectPath)}\",\"unityVersion\":\"{unityVersion}\"}}";
+        }
+
+        private static string Escape(string s) =>
+            s?.Replace("\\", "/").Replace("\"", "\\\"") ?? "";
+    }
+
     public static class SimpleJson
     {
         public static Dictionary<string, string> Parse(string json)

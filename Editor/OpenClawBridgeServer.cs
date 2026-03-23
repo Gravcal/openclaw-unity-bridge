@@ -179,6 +179,7 @@ namespace OpenClaw.UnityBridge.Editor
 
         private static string Route(string method, string path, string body)
         {
+            if (method == "GET"  && path == "/project")                    return ProjectApi.GetProjectInfo();
             if (method == "GET"  && path == "/scene")                      return SceneApi.GetSceneInfo();
             if (method == "GET"  && path == "/hierarchy")                  return SceneApi.GetHierarchy();
             if (method == "POST" && path == "/scene/save")                 return SceneApi.Save(body);
